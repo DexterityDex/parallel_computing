@@ -1,272 +1,295 @@
-#include <algorithm>
-#include <cassert>
-#include <chrono>
-#include <cstring>
+#include <complex>
 #include <iostream>
-#include <vector>
-#include <immintrin.h>
-#include <iomanip>
+#include <numbers>
 #include <random>
+#include <thread>
+#include <vector>
+#include <omp.h>
+#include <filesystem>
+#include <fstream>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <omp.h>
+#include <chrono>
+#include <iostream>
+#include <immintrin.h>
+#include <x86intrin.h>
+#include <cstddef>
 
-#include "csv_functions.h"
 
-#define cols 16384
-#define rows 16384
+using namespace std;
 
-void add_matrix(double* A, const double* B, const double* C, size_t total_elements) {
-    for (size_t i = 0; i < total_elements; i++) {
-        A[i] = B[i] + C[i];
+
+void transposeAVX2(double* out, const double* in, size_t rows, size_t cols)
+{
+    const size_t blockSize = 4; // 4 double = 256 бит
+
+    size_t i, j;
+    for (i = 0; i + blockSize <= rows; i += blockSize) {
+        for (j = 0; j + blockSize <= cols; j += blockSize) {
+
+            // Загружаем блок 4×4
+            __m256d row0 = _mm256_loadu_pd(&in[(i+0)*cols + j]); // a0 a1 a2 a3
+            __m256d row1 = _mm256_loadu_pd(&in[(i+1)*cols + j]); // b0 b1 b2 b3
+            __m256d row2 = _mm256_loadu_pd(&in[(i+2)*cols + j]); // c0 c1 c2 c3
+            __m256d row3 = _mm256_loadu_pd(&in[(i+3)*cols + j]); // d0 d1 d2 d3
+
+            // Разбиваем и переставляем пары строк
+            __m256d t0 = _mm256_unpacklo_pd(row0, row1); // a0 b0 a1 b1
+            __m256d t1 = _mm256_unpackhi_pd(row0, row1); // a2 b2 a3 b3
+            __m256d t2 = _mm256_unpacklo_pd(row2, row3); // c0 d0 c1 d1
+            __m256d t3 = _mm256_unpackhi_pd(row2, row3); // c2 d2 c3 d3
+
+            // Собираем верх и низ блока
+            __m256d r0 = _mm256_permute2f128_pd(t0, t2, 0x20); // a0 b0 c0 d0
+            __m256d r1 = _mm256_permute2f128_pd(t1, t3, 0x20); // a2 b2 c2 d2
+            __m256d r2 = _mm256_permute2f128_pd(t0, t2, 0x31); // a1 b1 c1 d1
+            __m256d r3 = _mm256_permute2f128_pd(t1, t3, 0x31); // a3 b3 c3 d3
+
+            // Сохраняем транспонированный блок
+            _mm256_storeu_pd(&out[(j+0)*rows + i], r0); // a0 b0 c0 d0
+            _mm256_storeu_pd(&out[(j+1)*rows + i], r1); // a1 b1 c1 d1
+            _mm256_storeu_pd(&out[(j+2)*rows + i], r2); // a2 b2 c2 d2
+            _mm256_storeu_pd(&out[(j+3)*rows + i], r3); // a3 b3 c3 d3
+        }
+
+
+        // хвостовые столбцы справа
+        for (; j < cols; ++j) {
+            for (size_t ii = 0; ii < blockSize && (i+ii)<rows; ++ii)
+                out[j*rows + (i+ii)] = in[(i+ii)*cols + j];
+        }
+    }
+
+    // хвостовые строки снизу
+    for (; i < rows; ++i) {
+        for (j = 0; j < cols; ++j)
+            out[j*rows + i] = in[i*cols + j];
     }
 }
 
-void add_matrix_avx2(double* C, const double* A, const double* B, size_t total_elements) {
-    size_t i = 0;
-    const size_t vec_size = 4;
 
-    for (; i + vec_size <= total_elements; i += vec_size) {
-        __m256d a = _mm256_loadu_pd(&A[i]);
-        __m256d b = _mm256_loadu_pd(&B[i]);
-        __m256d c = _mm256_add_pd(a, b);
-        _mm256_storeu_pd(&C[i], c);
-    }
-
-    for (; i < total_elements; ++i) {
-        C[i] = A[i] + B[i];
+void matrixPrint(double *matrix, size_t rows, size_t cols) {
+    cout << "Matrix:\n";
+    for (size_t r = 0; r < rows; r++){
+        for (size_t c = 0; c < cols; c++)
+            cout << matrix[r * cols + c] << ' ';
+        cout << endl;
     }
 }
 
-/**
- * Скалярное умножение матриц в формате row-major.
- * A: rA x cA
- * B: rB x cB
- * C: rC x cC
- * Условие:  B (rA x cB), C (cB x cA), результат A (rA x cA)
- */
-void mul_matrix(double* A, size_t rA, size_t cA,
-                const double* B, size_t rB, size_t cB,
-                const double* C, size_t rC, size_t cC) {
-    // Проверяем корректность размеров
-    assert(rA == rB);      // строки результата = строкам B
-    assert(cA == cC);      // столбцы результата = столбцам C
-    assert(cB == rC);      // внутренние размеры совпадают
 
-    for (size_t i = 0; i < rA; ++i) {
-        for (size_t j = 0; j < cA; ++j) {
-            double sum = 0.0;
-            for (size_t k = 0; k < cB; ++k) {
-                // B: [i][k], C: [k][j]
-                sum += B[i * cB + k] * C[k * cC + j];
+void matrixMul(double *result, const double *matA, const double *matB, size_t sharedDim, size_t rowsA, size_t colsB){
+    for (size_t r1 = 0; r1 < rowsA; r1++)
+        for (size_t c2 = 0; c2 < colsB; c2++) {
+            double accum = 0;
+            for (size_t i = 0; i < sharedDim; i++)
+                accum += matA[r1 * sharedDim + i] * matB[i * colsB + c2];
+            result[r1 * colsB + c2] = accum;
+        }
+}
+
+void matrixMulAVX2(double *result, const double *matA, const double *matB, size_t sharedDim, size_t rowsA, size_t colsB){
+
+    std::vector<double> TransposeT(colsB * sharedDim, 0.0);
+
+    if (sharedDim % 4 == 0 && colsB % 4 == 0)
+        transposeAVX2(TransposeT.data(), matB, colsB, sharedDim);
+    else {
+        for (size_t r = 0; r < sharedDim; ++r)
+            for (size_t c = 0; c < colsB; ++c)
+                TransposeT[c * sharedDim + r] = matB[r * colsB + c];
+    }
+
+    const double *matT = TransposeT.data();
+    double temp[4];
+
+    for (size_t r1 = 0; r1 < rowsA; r1++)
+        for (size_t c2 = 0; c2 < colsB; c2++) {
+            __m256d sum_vec = _mm256_setzero_pd();
+            size_t k = 0;
+
+            // Умножаем блоками по 4 double
+            for (; k + 3 < sharedDim; k += 4) {
+                __m256d x = _mm256_loadu_pd(&matA[r1 * sharedDim + k]);
+                __m256d y = _mm256_loadu_pd(&matT[c2 * sharedDim + k]);
+                sum_vec = _mm256_add_pd(sum_vec, _mm256_mul_pd(x, y));
             }
-            A[i * cA + j] = sum;
-        }
-    }
-}
 
-/**
- * AVX2-умножение матриц в формате row-major.
- * Векторизуем по 4 столбцам сразу.
- */
-void mul_matrix_avx2(double* A,
-                     size_t rA, size_t cA,
-                     const double* B,
-                     size_t rB, size_t cB,
-                     const double* C,
-                     size_t rC, size_t cC) {
-    assert(rA == rB);
-    assert(cA == cC);
-    assert(cB == rC);
+            // Суммируем 4 элемента внутри регистра
+            _mm256_storeu_pd(temp, sum_vec);
+            double result_val = temp[0] + temp[1] + temp[2] + temp[3];
 
-    const size_t vec_cols = 4;
-    size_t j_vec_end = (cA / vec_cols) * vec_cols; // максимум кратное 4
-
-    for (size_t i = 0; i < rA; ++i) {
-        // Векторизованная часть по 4 столбцам
-        for (size_t j = 0; j < j_vec_end; j += vec_cols) {
-            __m256d sum = _mm256_setzero_pd();
-
-            for (size_t k = 0; k < cB; ++k) {
-                double b_ik = B[i * cB + k];
-                __m256d b_vec = _mm256_set1_pd(b_ik);
-
-                __m256d c_vec = _mm256_loadu_pd(&C[k * cC + j]);
-
-                sum = _mm256_fmadd_pd(b_vec, c_vec, sum);
+            // Хвостовые элементы
+            for (; k < sharedDim; ++k) {
+                result_val += matA[r1 * sharedDim + k] * matT[c2 * sharedDim + k];
             }
 
-            _mm256_storeu_pd(&A[i * cA + j], sum);
+            result[r1 * colsB + c2] = result_val;
         }
+}
 
-        for (size_t j = j_vec_end; j < cA; ++j) {
-            double sum = 0.0;
-            for (size_t k = 0; k < cB; ++k) {
-                sum += B[i * cB + k] * C[k * cC + j];
+
+void matrixMulAVX2_gather(double *result, const double *matA, const double *matB,
+                          size_t sharedDim, size_t rowsA, size_t colsB) {
+
+    double temp[4];
+    for (size_t r1 = 0; r1 < rowsA; r1++) {
+        for (size_t c2 = 0; c2 < colsB; c2++) {
+            __m256d sum_vec = _mm256_setzero_pd();
+            size_t k = 0;
+
+            // Умножаем блоками по 4 double
+            for (; k + 3 < sharedDim; k += 4) {
+                __m256d a_vec = _mm256_loadu_pd(&matA[r1 * sharedDim + k]);
+
+                __m256i indices = _mm256_setr_epi64x(
+                        k * colsB + c2,
+                        (k + 1) * colsB + c2,
+                        (k + 2) * colsB + c2,
+                        (k + 3) * colsB + c2
+                );
+                __m256d b_vec = _mm256_i64gather_pd(matB, indices, sizeof(double));
+
+                sum_vec = _mm256_add_pd(sum_vec, _mm256_mul_pd(a_vec, b_vec));
             }
-            A[i * cA + j] = sum;
+
+            // Суммируем 4 элемента внутри регистра
+            _mm256_storeu_pd(temp, sum_vec);
+            double result_val = temp[0] + temp[1] + temp[2] + temp[3];
+
+            // Хвостовые элементы
+            for (; k < sharedDim; ++k) {
+                result_val += matA[r1 * sharedDim + k] * matB[k * colsB + c2];
+            }
+
+            result[r1 * colsB + c2] = result_val;
         }
     }
 }
 
-std::vector<double> generate_permutation_matrix(std::size_t n) {
-    std::vector<double> permut_matrix(n * n, 0.0);
+//void matrixMul_clear(double *result, const double *matA, const double *matB, size_t sharedDim, size_t rowsA, size_t colsB){
+//    for (size_t r1 = 0; r1 < rowsA / sizeof(__m256d); r1++)
+//        for (size_t c2 = 0; c2 < colsB; c2++) {
+//            __m256d accum = _mm256_setzero_pd();
+//            for (size_t i = 0; i < sharedDim; i++)
+//                __m256d x = _mm256_loadu_pd(&matA[r1 * sharedDim + i]);
+//                accum += matA[r1 * sharedDim + i] * matB[i * colsB + c2];
+//            result[r1 * colsB + c2] = accum;
+//        }
+//}
 
-    for (std::size_t i = 0; i < n; i++) {
-        // единицы на побочной диагонали
-        permut_matrix[i * n + (n - 1 - i)] = 1.0;
+
+
+void speedtest(size_t rowsA, size_t sharedDim, size_t colsB) {
+    std::vector<double> A = std::vector<double>(rowsA * sharedDim, 1.0);
+    std::vector<double> B = std::vector<double>(colsB * sharedDim);
+    std::vector<double> R1 = std::vector<double>(rowsA * colsB, 0.0);
+    std::vector<double> R2 = std::vector<double>(rowsA * colsB, 0.0);
+    std::vector<double> R3 = std::vector<double>(rowsA * colsB, 0.0);
+
+    for (size_t i = 0; i < colsB * sharedDim; ++i) {
+        B[i] = (double) i;
     }
 
-    return permut_matrix;
+    auto t1 = std::chrono::steady_clock::now();
+    matrixMul(R1.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    auto t2 = std::chrono::steady_clock::now();
+//    matrixPrint(R1.data(), rowsA, colsB);
+
+    auto t3 = std::chrono::steady_clock::now();
+    matrixMulAVX2(R2.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    auto t4 = std::chrono::steady_clock::now();
+//    matrixPrint(R2.data(), rowsA, colsB);
+
+    auto t5 = std::chrono::steady_clock::now();
+    matrixMulAVX2_gather(R3.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    auto t6 = std::chrono::steady_clock::now();
+//    matrixPrint(R3.data(), rowsA, colsB);
+
+    cout << "Duration of synchronous calc: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << endl;
+    cout << "Duration of AVX2 calc: " << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << endl;
+    cout << "Duration of AVX2_Gather calc: " << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count() << endl;
 }
 
-void randomize_matrix(double* matrix, std::size_t matrix_order) {
-    std::uniform_real_distribution<double> unif(0.0, 100000.0);
-    std::mt19937 rng(std::random_device{}());
 
-    for (std::size_t i = 0; i < matrix_order * matrix_order; i++) {
-        matrix[i] = unif(rng);
-    }
-}
+void speedtest_avg_openmp(size_t n) {
+    std::cout << "======= SPEEDTEST MATRIX MUL ==========" << std::endl;
 
-void print_matrix(const double* matrix, size_t colsc, size_t rowsc,
-                  size_t max_rows = 5, size_t max_cols = 5) {
-    std::cout << std::fixed << std::setprecision(2);
-    for (size_t r = 0; r < std::min(rowsc, max_rows); ++r) {
-        for (size_t c = 0; c < std::min(colsc, max_cols); ++c) {
-            std::cout << matrix[r * colsc + c] << " ";
-        }
-        std::cout << (colsc > max_cols ? "... " : "") << "\n";
-    }
-    if (rowsc > max_rows)
-        std::cout << "... \n";
-    std::cout << "\n";
-}
-
-int mul_matrix_experiment() {
-    const int num_attempts = 10;
-    const std::size_t matrix_order = 16 * 4 * 9; // 576
-
-    auto calculate_average_time =
-        [](auto func,
-           double* A,
-           const double* B,
-           const double* C,
-           size_t matrix_order,
-           int iterations)
+    std::cout << "Current dir: " << std::filesystem::current_path() << std::endl;
+    auto base_dir = std::filesystem::current_path().parent_path();
+    std::ofstream output(base_dir.append("output.csv"));
+    if (!output.is_open())
     {
-        double total_time = 0.0;
-
-        for (int i = 0; i < iterations; i++)
-        {
-            // каждый раз новый A, чтобы не было прогрева на одинаковых данных
-            randomize_matrix(A, matrix_order);
-
-            auto t1 = std::chrono::steady_clock::now();
-            func(A, matrix_order, matrix_order,
-                 B, matrix_order, matrix_order,
-                 C, matrix_order, matrix_order);
-            auto t2 = std::chrono::steady_clock::now();
-
-            total_time += std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        }
-        return total_time / iterations;
-    };
-
-    std::vector<double> A(matrix_order * matrix_order),
-                        B = generate_permutation_matrix(matrix_order),
-                        C(matrix_order * matrix_order),
-                        D(matrix_order * matrix_order);
-
-    randomize_matrix(A.data(), matrix_order);
-
-    std::cout << "Матрица A:\n";
-    print_matrix(A.data(), matrix_order, matrix_order);
-
-    std::cout << "Матрица B (перестановочная):\n";
-    print_matrix(B.data(), matrix_order, matrix_order);
-
-    // Проверка корректности
-    mul_matrix(C.data(), matrix_order, matrix_order,
-               A.data(), matrix_order, matrix_order,
-               B.data(), matrix_order, matrix_order);
-
-    mul_matrix_avx2(D.data(), matrix_order, matrix_order,
-                    A.data(), matrix_order, matrix_order,
-                    B.data(), matrix_order, matrix_order);
-
-    if (std::memcmp(static_cast<const void*>(C.data()),
-                    static_cast<const void*>(D.data()),
-                    matrix_order * matrix_order * sizeof(double)) != 0) {
-        std::cout << "Результат перемножения некорректен\n";
-        return -1;
+        std::cout << "Error while opening file" << std::endl;
+        return;
     }
 
-    double avg_time_basic = calculate_average_time(
-        mul_matrix, C.data(), A.data(), B.data(), matrix_order, num_attempts);
-    std::cout << "Скалярное умножение: время = "
-              << avg_time_basic << " мс, ускорение = 1\n";
+    output << "Sync,AVX2,AVX2Acceleration,Gather,GatherAcceleration\n";
 
-    double avg_time_avx2 = calculate_average_time(
-        mul_matrix_avx2, D.data(), A.data(), B.data(), matrix_order, num_attempts);
-    std::cout << "Векторное умножение (AVX2): время = "
-              << avg_time_avx2
-              << " мс, ускорение = " << (avg_time_basic / avg_time_avx2) << "\n";
+    std::vector<double> A = std::vector<double>(n * n, 1.0);
+    std::vector<double> B = std::vector<double>(n * n);
+    std::vector<double> R1 = std::vector<double>(n * n, 0.0);
+    std::vector<double> R2 = std::vector<double>(n * n, 0.0);
+    std::vector<double> R3 = std::vector<double>(n * n, 0.0);
 
-    return 0;
+    for (size_t i = 0; i < n * n; ++i) {
+        B[i] = (double) i;
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    matrixMul(R1.data(), A.data(), B.data(), n, n, n);
+    auto t2 = std::chrono::steady_clock::now();
+
+    auto t3 = std::chrono::steady_clock::now();
+    matrixMulAVX2(R2.data(), A.data(), B.data(), n, n, n);
+    auto t4 = std::chrono::steady_clock::now();
+
+    auto t5 = std::chrono::steady_clock::now();
+    matrixMulAVX2_gather(R3.data(), A.data(), B.data(), n, n, n);
+    auto t6 = std::chrono::steady_clock::now();
+
+    std::cout << "Sync time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+              << "\t| AVX2 time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count()
+              << "\t| AVX2 Acceleration: " << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count()
+              << "\t| Gather time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
+              << "\t| Gather Acceleration: " << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
+              << endl;
+
+    output << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << ","
+           << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << ","
+           << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << ","
+           << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count() << ","
+           << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
+           << endl;
+
+    output.close();
 }
 
-int sum_matrix() {
-    size_t total_elements = cols * rows;
-    std::vector<double> B(total_elements, 1.0),
-                        C(total_elements, -1.0),
-                        A(total_elements);
-
-    auto calculate_average_time =
-        [](auto func,
-           double* A, const double* B, const double* C,
-           size_t total_elements, int iterations)
-    {
-        double total_time = 0.0;
-        for (int i = 0; i < iterations; i++)
-        {
-            auto t1 = std::chrono::steady_clock::now();
-            func(A, B, C, total_elements);
-            auto t2 = std::chrono::steady_clock::now();
-            total_time += std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        }
-        return total_time / iterations;
-    };
-
-    const int num_attempts = 10;
-
-    std::cout << "Матрица B:\n";
-    print_matrix(B.data(), cols, rows);
-
-    std::cout << "Матрица C:\n";
-    print_matrix(C.data(), cols, rows);
-
-    double avg_time_basic = calculate_average_time(
-        add_matrix, A.data(), B.data(), C.data(), total_elements, num_attempts);
-    std::cout << "Среднее время. Обычное сложение: "
-              << avg_time_basic << " мс.\n";
-
-    std::cout << "Результат обычного сложения:\n";
-    print_matrix(A.data(), cols, rows);
-
-    std::fill_n(A.data(), total_elements, 0.0);
-    std::fill_n(B.data(), total_elements, 1.0);
-    std::fill_n(C.data(), total_elements, -1.0);
-
-    double avg_time_avx2 = calculate_average_time(
-        add_matrix_avx2, A.data(), B.data(), C.data(), total_elements, num_attempts);
-    std::cout << "Среднее время. AVX2: "
-              << avg_time_avx2 << " мс.\n";
-
-    std::cout << "Результат векторного сложения:\n";
-    print_matrix(A.data(), cols, rows);
-
-    return 0;
-}
 
 int main() {
-    // return mul_matrix_experiment();
-    return sum_matrix();
+    cout << "Test 1:" << endl;
+    std::size_t rowsA = 2, sharedDim = 3, colsB = 2;
+    std::vector<double> A(rowsA * sharedDim, 1.0);
+    std::vector<double> B(sharedDim * colsB, 2.0);
+    std::vector<double> R(rowsA * colsB, 0.0);
+
+    matrixMul(R.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    matrixPrint(R.data(), rowsA, colsB);
+
+    cout << "Test 2:" << endl;
+    rowsA = 2; sharedDim = 3; colsB = 2;
+    A = std::vector<double>({ 1.0, 2.0, -3.0,
+                              -2.0, 13.0, -2.0});
+    B = std::vector<double>({3.0, 4.0,
+                             5.0, -1.0,
+                             4.0, 4.0});
+    R = std::vector<double>(rowsA * colsB, 0.0);
+
+    matrixMul(R.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    matrixPrint(R.data(), rowsA, colsB);
+
+    speedtest_avg_openmp(1000);
+    return 0;
 }
