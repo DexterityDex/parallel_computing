@@ -1,4 +1,4 @@
-#include <complex>
+﻿#include <complex>
 #include <iostream>
 #include <numbers>
 #include <random>
@@ -255,6 +255,44 @@ void speedtest_avg_openmp(size_t n) {
               << "\t| AVX2 Acceleration: " << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count()
               << "\t| Gather time: " << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
               << "\t| Gather Acceleration: " << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
+              << endl;
+
+    output << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << ","
+           << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << ","
+           << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << ","
+           << std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count() << ","
+           << (double) std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() / std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count()
+           << endl;
+
+    output.close();
+}
+
+
+int main() {
+    cout << "Test 1:" << endl;
+    std::size_t rowsA = 2, sharedDim = 3, colsB = 2;
+    std::vector<double> A(rowsA * sharedDim, 1.0);
+    std::vector<double> B(sharedDim * colsB, 2.0);
+    std::vector<double> R(rowsA * colsB, 0.0);
+
+    matrixMul(R.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    matrixPrint(R.data(), rowsA, colsB);
+
+    cout << "Test 2:" << endl;
+    rowsA = 2; sharedDim = 3; colsB = 2;
+    A = std::vector<double>({ 1.0, 2.0, -3.0,
+                              -2.0, 13.0, -2.0});
+    B = std::vector<double>({3.0, 4.0,
+                             5.0, -1.0,
+                             4.0, 4.0});
+    R = std::vector<double>(rowsA * colsB, 0.0);
+
+    matrixMul(R.data(), A.data(), B.data(), sharedDim, rowsA, colsB);
+    matrixPrint(R.data(), rowsA, colsB);
+
+    speedtest_avg_openmp(1000);
+    return 0;
+}:milliseconds>(t6 - t5).count()
               << endl;
 
     output << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << ","
